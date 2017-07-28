@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
+#include <string.h>
 #include "mmpool.h"
 
 #define TH_NUM 20
@@ -30,7 +31,7 @@ void *p_malloc_func(void *arg)
 		memset(addr[idx], 15, idx);
 	}
 
-	//dump_mmpool(g_static_pool);
+	//mmpool_dump(g_static_pool);
 	sleep(1);
 
 	for(idx = S_IDX; idx < IDX; idx++)
@@ -38,7 +39,7 @@ void *p_malloc_func(void *arg)
 		mmpool_free(addr[idx]);
 	}
 
-	//dump_mmpool(g_static_pool);
+	//mmpool_dump(g_static_pool);
 	sleep(1);
 
 	for(idx = S_IDX; idx < IDX; idx++)
@@ -55,6 +56,20 @@ void *p_malloc_func(void *arg)
 	}
 
 	//dump_mmpool(g_static_pool);
+
+	sleep(1);
+	for(idx = 4000; idx < IDX; idx++)
+	{
+		addr[idx] = mmpool_malloc(g_static_pool, idx * 1024);
+		memset(addr[idx], 15, idx * 1024);
+	}
+
+	sleep(1);
+	for(idx = 4000; idx < IDX; idx++)
+	{
+		mmpool_free(addr[idx]);
+	}
+
 	printf("thread %d exit.\n", ppid);
 }
 
@@ -81,5 +96,6 @@ int main(int argc, char *argv[])
 
 	mmpool_dump(g_static_pool);
 	mmpool_destroy(g_static_pool);
+
 	return 0;
 }

@@ -16,13 +16,15 @@ typedef struct mm_block
 
 #define MM_BLOCK_HEAD_SIZE offsetof(MM_BLOCK, align_base)
 
+#define FREEMMB_BUCKET_SIZE 1025
 typedef struct mm_pool
 {
 	struct mm_pool *next;	/* next extend pool */
 	void *m_addr;		/* head address for this memory pool */
 	unsigned int size;	/* total size of this pool */
 	unsigned int free_size;	/* free size of this pool */
-	unsigned int free_block;/* numbers of free block */
+	unsigned int free_block;/* numbers of total free block */
+	unsigned int free_blocks[FREEMMB_BUCKET_SIZE];/* bucket to speed up block search*/
 	pthread_mutex_t m_lock; /* mutex to protect memory alloc/free */
 	pthread_mutex_t g_lock; /* mutex to protect the pool list, only for first pool */
 }MM_POOL;
