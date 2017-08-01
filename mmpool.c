@@ -28,13 +28,104 @@ typedef unsigned char BYTE;
 
 /* the size > 1024*MM_BLOCK_HEAD_SIZE, will located as huge block with index 1025 */
 #define SIZE_TO_INDEX(size) \
-	(((size)/MM_BLOCK_HEAD_SIZE)<=FREEMMB_BUCKET_SIZE?(((size)/MM_BLOCK_HEAD_SIZE)-1):(FREEMMB_BUCKET_SIZE-1))
+	(((size)/MM_BLOCK_HEAD_SIZE) <= FREEMMB_BUCKET_SIZE? \
+	(((size)/MM_BLOCK_HEAD_SIZE)-1) : (FREEMMB_BUCKET_SIZE-1))
 
-static inline int IS_ADDR_IN_POOL(const MM_POOL *pool, const void *addr)
+static int IS_ADDR_IN_POOL(const MM_POOL *pool, const void *addr)
 {
 	uintptr_t p_addr = (uintptr_t)pool->m_addr;
 	uintptr_t u_addr = (uintptr_t)addr;
 	return ( (u_addr >= p_addr) && (u_addr < p_addr + pool->size) );
+}
+
+void mmpool_ins_freelist(MM_POOL *pool, MM_BLOCK *mmb, MMB_LLE *mmb_lle)
+{
+	int index;
+
+	if(mmb_lle == NULL)
+	{
+		/* new list item */
+		mmb_lle = (MMB_LLE*)malloc(sizeof(MMB_LLE));
+		memset(mmb_lle, 0, sizeof(MMB_LLE));
+	}
+
+	index = SIZE_TO_INDEX(mmb->size);
+
+	if(pool->free_blocks_list[index] == NULL)
+	{
+		/* first item */
+		mmb_lle->prev = NULL;
+		mmb_lle->next = NULL;
+		mmb_lle->mmb = mmb;
+		
+		/* only record tail for head item. */
+		mmb_lle->tail = mmb_lle; 
+		pool->free_blocks_list[index] = mmb_lle;
+	}
+	else
+	{
+		MMB_LLE *p;
+		p = pool->free_blocks_list[index]->tail;
+
+		p->next = mmb_lle;
+		mmb_lle->prev = p;
+		mmb_lle->next = NULL;
+		mmb_lle->mmb = mmb;
+
+		pool->free_blocks_list[index]->tail = mmb_lle;
+	}
+}
+
+MMB_LLE *mmpool_del_freelist(MM_POOL *pool, MM_BLOCK *mmb)
+{
+	int index;
+	index = SIZE_TO_INDEX(mmb->size);
+
+	if(pool->free_blocks_list[index] != NULL)
+	{
+		MMB_LLE *mmb_lle;
+		mmb_lle = pool->free_blocks_list[index];
+		
+		/* in case we are the head item */
+		if(mmb_lle->mmb == mmb)
+		{
+			pool->free_blocks_list[index] = mmb_lle->next;
+			if(pool->free_blocks_list[index])
+			{
+				pool->free_blocks_list[index]->tail = mmb_lle->tail;
+			}
+			return mmb_lle;
+		}
+		else if(mmb_lle->tail->mmb == mmb)
+		{
+			/* in case we are the tail item*/
+			MMB_LLE *tail;
+
+			tail = mmb_lle->tail;
+			pool->free_blocks_list[index]->tail = tail->prev;
+			tail->prev->next = NULL;
+			return tail;
+		}
+		else
+		{
+			MMB_LLE *p;
+			for(p = mmb_lle; p; p = p->next)
+			{
+				if(p->mmb == mmb)
+					break;
+			}
+
+			if(p != NULL)
+			{
+				p->prev->next = p->next;
+				p->next->prev = p->prev;
+
+				return p;
+			}
+		}
+	}
+
+	return NULL;
 }
 
 MM_POOL *mmpool_init(void)
@@ -73,6 +164,7 @@ MM_POOL *mmpool_init(void)
 	first_mmb->flags = 0;
 	first_mmb->pool = g_pool;
 	first_mmb->prev = NULL;
+	mmpool_ins_freelist(g_pool, first_mmb, NULL);
 
 	return g_pool;
 }
@@ -141,19 +233,46 @@ static MM_BLOCK *pool_get_next_mmb(MM_POOL *pool, MM_BLOCK *mmb)
 
 static MM_BLOCK *pool_get_mmb(MM_POOL *pool, unsigned int size)
 {
+	MMB_LLE *mmb_lle;
 	MM_BLOCK *mmb;
+	int i, match_index = -1;
 	
 	MM_POOL_LOCK(pool);
-	mmb = POOL_FIRST_MMBLOCK(pool);
 
-	while((mmb != NULL))
+	/* find a best match index */
+	i = SIZE_TO_INDEX(size);
+	for(;i < FREEMMB_BUCKET_SIZE; i++)
 	{
+		if(pool->free_blocks[i] > 0)
+		{
+			match_index = i;
+			break;
+		}
+	}
+
+	if(match_index == -1)
+	{
+		/* no free match size block */
+		MM_POOL_UNLOCK(pool);
+		return NULL;
+	}
+
+	mmb_lle = pool->free_blocks_list[match_index]; 
+
+	while((mmb_lle != NULL))
+	{
+		mmb = mmb_lle->mmb;
+
 		if(!(mmb->flags & MMB_IN_USE) && (mmb->size >= size))
 		{
+			MMB_LLE *p;
+
 			/* got a free memory block in size */
 			mmb->flags |= MMB_IN_USE;
 			mmb->pool = pool;
 
+			p = mmpool_del_freelist(pool, mmb);
+			
 			/* try to split the block if possiable */
 			if((mmb->size - size) > 2 * MM_BLOCK_HEAD_SIZE)
 			{
@@ -167,6 +286,9 @@ static MM_BLOCK *pool_get_mmb(MM_POOL *pool, unsigned int size)
 				new_mmb->size = mmb->size - size - MM_BLOCK_HEAD_SIZE;
 				pool->free_blocks[SIZE_TO_INDEX(new_mmb->size)]++;
 				new_mmb->prev = mmb;
+
+				/* insert new mmb to free list */
+				mmpool_ins_freelist(pool, new_mmb, p);
 				
 				pool->free_blocks[SIZE_TO_INDEX(mmb->size)]--;
 				mmb->size = size;
@@ -177,13 +299,14 @@ static MM_BLOCK *pool_get_mmb(MM_POOL *pool, unsigned int size)
 			{
 				pool->free_blocks[SIZE_TO_INDEX(mmb->size)]--;
 				pool->free_block--;
+				free(p);
 			}
 
 			pool->free_size -= MMBLOCK_SIZE(mmb);
 			MM_POOL_UNLOCK(pool);
 			return mmb;
 		}	
-		mmb = pool_get_next_mmb(pool, mmb);
+		mmb_lle = mmb_lle->next; 
 	}
 
 	MM_POOL_UNLOCK(pool);
@@ -207,33 +330,17 @@ void *mmpool_malloc(MM_POOL *g_pool, unsigned int size)
 	/* find a befitting pool and allocate the memory */
 	for(cur_pool = g_pool; cur_pool; cur_pool = cur_pool->next)
 	{
-		int i, match = 0;
-
 		if(size > cur_pool->free_size)
 		{
 			last_pool = cur_pool;
 			continue;
 		}
 
-		/* find if a block size match to request size */
-		i = SIZE_TO_INDEX(size);
-		for(;i < FREEMMB_BUCKET_SIZE; i++)
+		mmb = pool_get_mmb(cur_pool, size);
+		if(mmb)
 		{
-			if(cur_pool->free_blocks[i] > 0)
-			{
-				match = 1;
-				break;
-			}
-		}
-		
-		if(match)
-		{
-			mmb = pool_get_mmb(cur_pool, size);
-			if(mmb)
-			{
-				MM_POOL_LIST_UNLOCK(g_pool);
-				return (void*)(&mmb->align_base);
-			}
+			MM_POOL_LIST_UNLOCK(g_pool);
+			return (void*)(&mmb->align_base);
 		}
 
 		last_pool = cur_pool;
@@ -273,6 +380,7 @@ void *mmpool_malloc(MM_POOL *g_pool, unsigned int size)
         mmb->flags = 0;
         mmb->pool = new_pool;
 	mmb->prev = NULL;
+	mmpool_ins_freelist(new_pool, mmb, NULL);
 
 	/* allocate memory from new pool */
 	mmb = pool_get_mmb(new_pool, size);
@@ -288,12 +396,15 @@ void *mmpool_malloc(MM_POOL *g_pool, unsigned int size)
 void pool_merge(MM_POOL *pool, MM_BLOCK *mmb)
 {
 	MM_BLOCK *mmb_prev, *mmb_next;
+	MMB_LLE *mmb_lle_prev = NULL, *mmb_lle_next =  NULL;
 
 	mmb_prev = mmb->prev;
 	/* merge with prev block*/
         if(mmb_prev && !(mmb_prev->flags & MMB_IN_USE))
         {   
                 MM_BLOCK *cur_mmb_next;
+
+		mmb_lle_prev = mmpool_del_freelist(pool, mmb_prev);
 
                 cur_mmb_next = pool_get_next_mmb(pool, mmb);
                 if(cur_mmb_next)
@@ -318,6 +429,8 @@ void pool_merge(MM_POOL *pool, MM_BLOCK *mmb)
 	{
 		MM_BLOCK *mmb_nnext;
 
+		mmb_lle_next = mmpool_del_freelist(pool, mmb_next);
+
 		mmb_nnext = pool_get_next_mmb(pool, mmb_next);
 		if(mmb_nnext)
 		{
@@ -332,6 +445,23 @@ void pool_merge(MM_POOL *pool, MM_BLOCK *mmb)
 		pool->free_block--;
 		memset(mmb_next, 0, MM_BLOCK_HEAD_SIZE);
 	}
+
+	if(mmb_lle_prev != NULL)
+	{
+		mmpool_ins_freelist(pool, mmb, mmb_lle_prev);
+		if(mmb_lle_next != NULL)
+			free(mmb_lle_next);
+	}
+	else if(mmb_lle_next != NULL)
+	{
+		mmpool_ins_freelist(pool, mmb, mmb_lle_next);
+	}
+	else
+	{
+		/* merge nothing, insert as a new item */
+		mmpool_ins_freelist(pool, mmb, NULL);
+	}
+
 }
 
 void mmpool_free(void *addr)

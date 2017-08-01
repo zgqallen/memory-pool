@@ -2,6 +2,8 @@
 #include <stdlib.h>
 #include <pthread.h>
 #include <string.h>
+#include <unistd.h>
+
 #include "mmpool.h"
 
 #define TH_NUM 20
@@ -12,7 +14,8 @@ MM_POOL *g_static_pool;
 
 #ifdef GLIBC
 MM_POOL* mmpool_init() {return NULL;}
-#define mmpool_destroy(a, b)
+#define mmpool_destroy(a)
+#define mmpool_dump(a)
 #define mmpool_malloc(a, b) malloc(b)
 #define mmpool_free(a) free(a)
 #endif
@@ -94,7 +97,7 @@ int main(int argc, char *argv[])
 		pthread_join(th[idx], NULL);
 	}
 
-	mmpool_dump(g_static_pool);
+	//mmpool_dump(g_static_pool);
 	mmpool_destroy(g_static_pool);
 
 	return 0;
