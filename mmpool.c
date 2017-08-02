@@ -299,10 +299,8 @@ static MM_BLOCK *pool_get_mmb(MM_POOL *pool, unsigned int size)
 				INC_POOL_FREEBLOCKS(pool, new_mmb);
 				mmpool_ins_freelist(pool, new_mmb, NULL);
 
-				/* update the mmb size and the freeblocks to reuse p */				
+				/* update the new mmb size */				
 				mmb->size = size;
-				INC_POOL_FREEBLOCKS(pool, mmb);
-				mmpool_ins_freelist(pool, mmb, p);
 			}
 			else
 			{
