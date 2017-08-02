@@ -97,7 +97,7 @@ int main(int argc, char *argv[])
 		pthread_join(th[idx], NULL);
 	}
 
-	//mmpool_dump(g_static_pool);
+	mmpool_dump(g_static_pool);
 	mmpool_destroy(g_static_pool);
 
 	return 0;

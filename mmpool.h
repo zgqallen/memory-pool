@@ -1,12 +1,13 @@
 #ifndef _MMPOOL_H
 #define _MMPOOL_H
+
 #include <pthread.h>
 #include <stddef.h>
 
 typedef struct mm_block
 {
-	void *pool;		/* pointer to pool belongs to */
-	struct mm_block *prev;	/* prev block for merging */
+	void *pool;		/* pointer to pool belongs to, used for free */
+	struct mm_block *prev;	/* prev block for quick merging */
 	unsigned int size;	/* size of this block */
 	int flags;		/* flag for this block */
 	int padding[2];		/* padding to 32 bytes */
@@ -27,15 +28,14 @@ typedef struct mmb_lle
 #define FREEMMB_BUCKET_SIZE 1025
 typedef struct mm_pool
 {
-	struct mm_pool *next;	/* next extend pool */
-	void *m_addr;		/* head address for this memory pool */
-	unsigned int size;	/* total size of this pool */
-	unsigned int free_size;	/* free size of this pool */
-	unsigned int free_block;/* numbers of total free block */
-	unsigned int free_blocks[FREEMMB_BUCKET_SIZE]; /* bucket to speed up block search*/
-	MMB_LLE	*free_blocks_list[FREEMMB_BUCKET_SIZE]; /* bucket to speed up block search*/
-	pthread_mutex_t m_lock; /* mutex to protect memory alloc/free */
-	pthread_mutex_t g_lock; /* mutex to protect the pool list, only for first pool */
+	struct mm_pool *next;		/* next sub pool */
+	void *m_addr;			/* start address for this memory pool */
+	unsigned int size;		/* total size of this pool */
+	unsigned int free_size;		/* free size of this pool */
+	unsigned int free_blocks[FREEMMB_BUCKET_SIZE]; /* bucket free blocks stats */
+	MMB_LLE	*free_blocks_list[FREEMMB_BUCKET_SIZE]; /* bucket free blocks list for quick access*/
+	pthread_mutex_t m_lock; 	/* mutex to protect memory allocation from the current pool */
+	pthread_mutex_t g_lock; 	/* mutex to protect pool list, only for first pool */
 }MM_POOL;
 
 #define MM_POOL_LOCK(pool) pthread_mutex_lock(&pool->m_lock)
