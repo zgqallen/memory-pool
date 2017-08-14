@@ -3,13 +3,16 @@
 #include <pthread.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/time.h>
 
 #include "mmpool.h"
 
-#define TH_NUM 20
+#define TH_NUM 60
 MM_POOL *g_static_pool;
+int g_ppid[TH_NUM] = {0};
 
-#define IDX 4096
+
+#define IDX 10000
 #define S_IDX 1
 
 #ifdef GLIBC
@@ -35,7 +38,7 @@ void *p_malloc_func(void *arg)
 	}
 
 	//mmpool_dump(g_static_pool);
-	sleep(1);
+	usleep(500);
 
 	for(idx = S_IDX; idx < IDX; idx++)
 	{
@@ -43,16 +46,16 @@ void *p_malloc_func(void *arg)
 	}
 
 	//mmpool_dump(g_static_pool);
-	sleep(1);
+	usleep(500);
 
 	for(idx = S_IDX; idx < IDX; idx++)
 	{
-		addr[idx] = mmpool_malloc(g_static_pool, idx * 3);
-		memset(addr[idx], 15, idx * 3);
+		addr[idx] = mmpool_malloc(g_static_pool, 256);
+		memset(addr[idx], 15, 256);
 	}
 
 	//dump_mmpool(g_static_pool);
-	sleep(1);
+	usleep(500);
 	for(idx = IDX-1; idx >= S_IDX; idx--)
 	{
 		mmpool_free(addr[idx]);
@@ -60,15 +63,15 @@ void *p_malloc_func(void *arg)
 
 	//dump_mmpool(g_static_pool);
 
-	sleep(1);
-	for(idx = 4000; idx < IDX; idx++)
+	usleep(500);
+	for(idx = 4000; idx < 4096; idx++)
 	{
 		addr[idx] = mmpool_malloc(g_static_pool, idx * 1024);
 		memset(addr[idx], 15, idx * 1024);
 	}
 
-	sleep(1);
-	for(idx = 4000; idx < IDX; idx++)
+	usleep(500);
+	for(idx = 4000; idx < 4096; idx++)
 	{
 		mmpool_free(addr[idx]);
 	}
@@ -81,14 +84,18 @@ int main(int argc, char *argv[])
 {
 	int idx;
 	pthread_t th[TH_NUM];
+	struct timeval start, stop;
+	unsigned long us;
 
+	
+	gettimeofday(&start, 0);
 	g_static_pool = mmpool_init();
 
 	for(idx = 0; idx < TH_NUM; idx++)
 	{
-		int ppid = idx;
-		pthread_create(&th[idx], 0, p_malloc_func, (void*)&ppid);
-		sleep(1);
+		g_ppid[idx] = idx;
+		pthread_create(&th[idx], 0, p_malloc_func, (void*)&g_ppid[idx]);
+		usleep(500);
 	}
 	
 
@@ -97,7 +104,12 @@ int main(int argc, char *argv[])
 		pthread_join(th[idx], NULL);
 	}
 
-	mmpool_dump(g_static_pool);
+	gettimeofday(&stop, 0);
+	us = stop.tv_usec - start.tv_usec;
+	us += (stop.tv_sec - start.tv_sec) * 5000000;
+	printf("used time: %lu ms.\n", us/5000);
+
+	//mmpool_dump(g_static_pool);
 	mmpool_destroy(g_static_pool);
 
 	return 0;

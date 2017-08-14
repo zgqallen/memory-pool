@@ -8,7 +8,7 @@
 #include "mmpool.h"
 
 #define DEFAULT_PAGE_SIZE 4096 /* 4k */
-#define DEFAULT_PAGE_COUNT 1024 /* 4MB*/
+#define DEFAULT_PAGE_COUNT 16384 /* 64MB*/
 
 static unsigned int pgsize = DEFAULT_PAGE_SIZE;
 
@@ -34,7 +34,7 @@ typedef unsigned char BYTE;
 	(((size)/MM_BLOCK_HEAD_SIZE) <= FREEMMB_BUCKET_SIZE? \
 	(((size)/MM_BLOCK_HEAD_SIZE)-1) : (FREEMMB_BUCKET_SIZE-1))
 
-#define INC_POOL_FREEBLOCKS(pool, mmb) ((pool)->free_blocks[SIZE_TO_INDEX((mmb)->size)]++)
+#define INC_POOL_FREEBLOCKS(pool, mmb) ((pool)->free_blocks[SIZE_TO_INDEX((mmb)->size)]++);	
 #define DEC_POOL_FREEBLOCKS(pool, mmb) ((pool)->free_blocks[SIZE_TO_INDEX((mmb)->size)]--)
 
 static int IS_ADDR_IN_POOL(const MM_POOL *pool, const void *addr)
@@ -159,9 +159,8 @@ MM_POOL *mmpool_init(void)
 	}
 
 	pthread_mutex_init(&g_pool->m_lock, NULL);
-	pthread_mutex_init(&g_pool->g_lock, NULL);
 	g_pool->free_size = g_pool->size;
-	g_pool->next = NULL;
+	g_pool->main_pool = g_pool;
 
 	first_mmb = POOL_FIRST_MMBLOCK(g_pool);
 	first_mmb->size = g_pool->size - MM_BLOCK_HEAD_SIZE;
@@ -172,6 +171,16 @@ MM_POOL *mmpool_init(void)
 	INC_POOL_FREEBLOCKS(g_pool, first_mmb);
 	mmpool_ins_freelist(g_pool, first_mmb, NULL);
 
+	/* for main pool only */
+	g_pool->meta = (POOL_META*)malloc(sizeof(POOL_META));
+	memset(g_pool->meta, 0, sizeof(POOL_META));
+	pthread_mutex_init(&g_pool->meta->g_lock, NULL);
+	
+	g_pool->idx = 0;
+	g_pool->meta->pool_len = 1;
+	g_pool->meta->pool_array[g_pool->idx] = g_pool;
+	g_pool->meta->pool_weight[g_pool->idx]++;
+
 	return g_pool;
 }
 
@@ -179,10 +188,13 @@ void _mmpool_destroy(MM_POOL *pool, int all)
 {
 	if(all)
 	{
-		MM_POOL *cur_pool;
-		for(cur_pool = pool; cur_pool; cur_pool = cur_pool->next)
+		/* the input pool must be main pool*/
+		int idx;
+		POOL_META *meta = pool->meta;
+
+		for(idx = 0; idx < meta->pool_len; idx++)
 		{
-			munmap(cur_pool->m_addr, cur_pool->size);
+			munmap(meta->pool_array[idx]->m_addr, meta->pool_array[idx]->size);
 		}
 	}
 	else
@@ -195,35 +207,6 @@ void _mmpool_destroy(MM_POOL *pool, int all)
 void mmpool_destroy(MM_POOL *pool)
 {
         _mmpool_destroy(pool, 1); 
-}
-
-void mmpool_recycle(MM_POOL *g_pool)
-{
-	MM_POOL *last_pool, *cur_pool;
-	
-	MM_POOL_LOCK(g_pool);
-	last_pool = g_pool;
-	cur_pool = g_pool->next;
-
-	while(cur_pool != NULL)
-	{
-		if(cur_pool->free_size == cur_pool->size)
-		{
-			MM_POOL *freep;
-			freep = cur_pool;		
-
-			last_pool->next = cur_pool->next;
-			cur_pool = cur_pool->next;
-			_mmpool_destroy(freep, 0);
-			free(freep);
-		}
-		else
-		{
-			last_pool = cur_pool;
-			cur_pool = cur_pool->next;
-		}
-	}
-	MM_POOL_UNLOCK(g_pool);
 }
 
 static MM_BLOCK *pool_get_next_mmb(MM_POOL *pool, MM_BLOCK *mmb)
@@ -280,6 +263,7 @@ static MM_BLOCK *pool_get_mmb(MM_POOL *pool, unsigned int size)
 			/* delete the mmb from the freeblocks list */
 			p = mmpool_del_freelist(pool, mmb);
 			DEC_POOL_FREEBLOCKS(pool, mmb);
+			ATOMIC_DEC(&pool->main_pool->meta->pool_weight[pool->idx]);
 			
 			/* try to split the block if possiable */
 			if((mmb->size - size) > 2 * MM_BLOCK_HEAD_SIZE)
@@ -297,6 +281,7 @@ static MM_BLOCK *pool_get_mmb(MM_POOL *pool, unsigned int size)
 
 				/* insert new mmb to freeblocks list */
 				INC_POOL_FREEBLOCKS(pool, new_mmb);
+				ATOMIC_INC(&pool->main_pool->meta->pool_weight[pool->idx]);
 				mmpool_ins_freelist(pool, new_mmb, NULL);
 
 				/* update the new mmb size */				
@@ -318,10 +303,50 @@ static MM_BLOCK *pool_get_mmb(MM_POOL *pool, unsigned int size)
 	return NULL;
 }
 
+int pool_pick_one(MM_POOL *g_pool)
+{
+	POOL_META *meta = g_pool->meta;
+	int proportion[MAX_POOL_NUM] = {0};
+	int rnd, idx, pro_sum = 0;
+
+	/*
+	** Per valgrind callgrind tuning, we found the time cost on going
+	** through pool list was high. So we implement a weighted random 
+	** select to speed up the memory allocation pool hit, the weight
+	** is the freeblocks number of the pool.
+	** For example the werght as below:
+	** [1, 0, 3, 5, 0, 6] for pool idx [0-> 5], then probability will
+	** be [6%, 0%, 20%, 33%, 0, 40%] to return the index.
+	*/
+	for(idx = 0; idx < meta->pool_len; idx++)
+	{
+		pro_sum += meta->pool_weight[idx];
+		if(meta->pool_weight == 0)
+			proportion[idx] = 0;
+		else
+			proportion[idx] = pro_sum;
+	}
+
+	if(pro_sum > 0)
+	{
+		srand((unsigned)time(NULL));
+		rnd = rand()%pro_sum;
+		for(idx = 0; idx < meta->pool_len; idx++)
+		{
+			if(proportion[idx] != 0 && rnd <= proportion[idx])
+				return idx;
+		}
+	}
+
+	return meta->pool_len/2;
+}
+
 void *mmpool_malloc(MM_POOL *g_pool, unsigned int size)
 {
 	MM_BLOCK *mmb;
 	MM_POOL  *cur_pool, *last_pool, *new_pool;
+	POOL_META *meta;
+	int idx;
 
 	if(size == 0)
 	{
@@ -333,22 +358,37 @@ void *mmpool_malloc(MM_POOL *g_pool, unsigned int size)
 
 	MM_POOL_LIST_LOCK(g_pool);
 	/* find a befitting pool and allocate the memory */
-	for(cur_pool = g_pool; cur_pool; cur_pool = cur_pool->next)
+	idx = pool_pick_one(g_pool);
+	meta = g_pool->meta;
+
+	for(; idx < meta->pool_len; idx++)
 	{
-		if(size > cur_pool->free_size)
+		if(size > meta->pool_array[idx]->free_size)
 		{
-			last_pool = cur_pool;
 			continue;
 		}
 
-		mmb = pool_get_mmb(cur_pool, size);
+		mmb = pool_get_mmb(meta->pool_array[idx], size);
 		if(mmb)
 		{
 			MM_POOL_LIST_UNLOCK(g_pool);
 			return (void*)(&mmb->align_base);
 		}
+	}
 
-		last_pool = cur_pool;
+	for(--idx; idx >= 0; idx--)
+	{
+                if(size > meta->pool_array[idx]->free_size)
+                {   
+                        continue;
+                }   
+
+                mmb = pool_get_mmb(meta->pool_array[idx], size);
+                if(mmb)
+                {   
+                        MM_POOL_LIST_UNLOCK(g_pool);
+                        return (void*)(&mmb->align_base);
+                } 	
 	}
 	MM_POOL_LIST_UNLOCK(g_pool);
 
@@ -376,7 +416,7 @@ void *mmpool_malloc(MM_POOL *g_pool, unsigned int size)
 
 	pthread_mutex_init(&new_pool->m_lock, NULL);
 	new_pool->free_size = new_pool->size;
-	new_pool->next = NULL;
+	new_pool->main_pool = g_pool;
 
         mmb = POOL_FIRST_MMBLOCK(new_pool);
         mmb->size = new_pool->size - MM_BLOCK_HEAD_SIZE;
@@ -391,8 +431,11 @@ void *mmpool_malloc(MM_POOL *g_pool, unsigned int size)
 	mmb = pool_get_mmb(new_pool, size);
 
         MM_POOL_LIST_LOCK(g_pool);
-	/* link to pool list */
-        last_pool->next = new_pool;
+	/* add to main pool array */
+	new_pool->idx = meta->pool_len;
+	meta->pool_len++;
+	meta->pool_array[new_pool->idx] = new_pool;
+	meta->pool_weight[new_pool->idx]++;        
         MM_POOL_LIST_UNLOCK(g_pool);
 
 	return (void*)(&mmb->align_base);
@@ -418,6 +461,7 @@ void pool_merge(MM_POOL *pool, MM_BLOCK *mmb)
 		/* delete prev mmb from freeblock list with old size*/
 		mmb_lle_prev = mmpool_del_freelist(pool, mmb_prev);
 		DEC_POOL_FREEBLOCKS(pool, mmb_prev);
+		ATOMIC_DEC(&pool->main_pool->meta->pool_weight[pool->idx]);
 
 		/* update the prev size and update mmb to new prev */
                 mmb_prev->size += MMBLOCK_SIZE(mmb);
@@ -440,6 +484,7 @@ void pool_merge(MM_POOL *pool, MM_BLOCK *mmb)
 		/* delete next mmb from freeblock list with old size */
 		mmb_lle_next = mmpool_del_freelist(pool, mmb_next);
 		DEC_POOL_FREEBLOCKS(pool, mmb_next);
+		ATOMIC_DEC(&pool->main_pool->meta->pool_weight[pool->idx]);
 
 		/* update the mmb to new size merged with next */
 		mmb->size += MMBLOCK_SIZE(mmb_next);
@@ -450,6 +495,7 @@ void pool_merge(MM_POOL *pool, MM_BLOCK *mmb)
 	{
 		mmpool_ins_freelist(pool, mmb, mmb_lle_prev);
 		INC_POOL_FREEBLOCKS(pool, mmb);
+		ATOMIC_INC(&pool->main_pool->meta->pool_weight[pool->idx]);
 
 		if(mmb_lle_next != NULL)
 			free(mmb_lle_next);
@@ -458,12 +504,14 @@ void pool_merge(MM_POOL *pool, MM_BLOCK *mmb)
 	{
 		mmpool_ins_freelist(pool, mmb, mmb_lle_next);
 		INC_POOL_FREEBLOCKS(pool, mmb);
+		ATOMIC_INC(&pool->main_pool->meta->pool_weight[pool->idx]);
 	}
 	else
 	{
 		/* merge nothing, insert as a new item */
 		mmpool_ins_freelist(pool, mmb, NULL);
 		INC_POOL_FREEBLOCKS(pool, mmb);
+		ATOMIC_INC(&pool->main_pool->meta->pool_weight[pool->idx]);
 	}
 
 }
@@ -496,10 +544,13 @@ void mmpool_free(void *addr)
 
 void _mmpool_dump(MM_POOL *pool, int all)
 {
+	POOL_META *meta;
 	MM_POOL *cur_pool;
+	int idx = 0;
 
 	printf("---------------------------------- START DUMP MMPOOL ----------------------------------\n");
-	for(cur_pool = pool; cur_pool; cur_pool = cur_pool->next)
+	cur_pool = pool;
+	do
 	{
 		MM_BLOCK *mmb;
 		int i;
@@ -527,8 +578,17 @@ void _mmpool_dump(MM_POOL *pool, int all)
 		MM_POOL_UNLOCK(cur_pool);
 
 		if(!all)
+		{
 			break;
-	}
+		}
+		else
+		{
+			meta = pool->meta;
+			cur_pool = meta->pool_array[++idx];
+			if(idx >= meta->pool_len)
+				break;
+		}
+	}while(1);
 	printf("------------------------------ END DUMP MMPOOL ----------------------------------------\n");
 }
 

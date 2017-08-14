@@ -28,20 +28,37 @@ typedef struct mmb_lle
 #define FREEMMB_BUCKET_SIZE 1025
 typedef struct mm_pool
 {
-	struct mm_pool *next;		/* next sub pool */
+	struct mm_pool *main_pool;	/* link to main pool */
+	int idx;			/* index map to location in pool_array */
 	void *m_addr;			/* start address for this memory pool */
 	unsigned int size;		/* total size of this pool */
 	unsigned int free_size;		/* free size of this pool */
 	unsigned int free_blocks[FREEMMB_BUCKET_SIZE]; /* bucket free blocks stats */
 	MMB_LLE	*free_blocks_list[FREEMMB_BUCKET_SIZE]; /* bucket free blocks list for quick access*/
 	pthread_mutex_t m_lock; 	/* mutex to protect memory allocation from the current pool */
-	pthread_mutex_t g_lock; 	/* mutex to protect pool list, only for first pool */
+	struct pool_meta *meta; 	/* only for first main pool */
 }MM_POOL;
+
+#define MAX_POOL_NUM 1024		/* assume the pool size not exceed 65G */
+typedef struct pool_meta
+{
+	MM_POOL *pool_array[MAX_POOL_NUM]; /* Pool array for all allocated pools. */
+	int pool_weight[MAX_POOL_NUM];	   /* Weight for each pool based on freeblocks */
+	int pool_len;			   /* Total number of current alloacted pools */
+	pthread_mutex_t g_lock;            /* mutex to protect pool meta. */
+}POOL_META;
 
 #define MM_POOL_LOCK(pool) pthread_mutex_lock(&pool->m_lock)
 #define MM_POOL_UNLOCK(pool) pthread_mutex_unlock(&pool->m_lock)
-#define MM_POOL_LIST_LOCK(pool) pthread_mutex_lock(&pool->g_lock)
-#define MM_POOL_LIST_UNLOCK(pool) pthread_mutex_unlock(&pool->g_lock)
+#define MM_POOL_LIST_LOCK(pool) pthread_mutex_lock(&pool->meta->g_lock)
+#define MM_POOL_LIST_UNLOCK(pool) pthread_mutex_unlock(&pool->meta->g_lock)
+
+#ifndef ATOMIC_INC
+#define ATOMIC_INC(ptr) __sync_add_and_fetch(ptr, 1); 
+#endif
+#ifndef ATOMIC_DEC
+#define ATOMIC_DEC(ptr) __sync_sub_and_fetch(ptr, 1);
+#endif
 
 /*
 ** MMPOOL_INIT
