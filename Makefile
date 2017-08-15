@@ -10,10 +10,13 @@ mm_test: $(OBJS)
 mm_test_glibc:
 	$(CC) mm_unittest.c -DGLIBC -o $@ $(INCLUDES) $(LDFLAGS)
 
+mm_test_debug:
+	$(CC) mmpool.c mm_unittest.c -DDEBUG -g -o $@ $(INCLUDES) $(LDFLAGS)
+
 %.o: %.c 
 	$(CC) -c -o $@ $< $(INCLUDES)
 
-all: mm_test mm_test_glibc
+all: mm_test mm_test_glibc mm_test_debug
 
 clean:
-	rm *.o mm_test mm_test_glibc
+	rm *.o mm_test mm_test_glibc mm_test_debug

@@ -7,7 +7,7 @@
 
 #include "mmpool.h"
 
-#define TH_NUM 60
+#define TH_NUM 100
 MM_POOL *g_static_pool;
 int g_ppid[TH_NUM] = {0};
 
@@ -19,6 +19,7 @@ int g_ppid[TH_NUM] = {0};
 MM_POOL* mmpool_init() {return NULL;}
 #define mmpool_destroy(a)
 #define mmpool_dump(a)
+#define mmpool_dump_counter(a)
 #define mmpool_malloc(a, b) malloc(b)
 #define mmpool_free(a) free(a)
 #endif
@@ -77,21 +78,27 @@ void *p_malloc_func(void *arg)
 	}
 
 	printf("thread %d exit.\n", ppid);
+
+	return NULL;
 }
 
 
 int main(int argc, char *argv[])
 {
-	int idx;
+	int idx, th_num = 1;
 	pthread_t th[TH_NUM];
 	struct timeval start, stop;
 	unsigned long us;
 
+	if(argc > 1)
+	{
+		th_num =  atoi(argv[1]);
+	}
 	
 	gettimeofday(&start, 0);
 	g_static_pool = mmpool_init();
 
-	for(idx = 0; idx < TH_NUM; idx++)
+	for(idx = 0; idx < th_num; idx++)
 	{
 		g_ppid[idx] = idx;
 		pthread_create(&th[idx], 0, p_malloc_func, (void*)&g_ppid[idx]);
@@ -99,7 +106,7 @@ int main(int argc, char *argv[])
 	}
 	
 
-	for(idx = 0; idx < TH_NUM; idx++)
+	for(idx = 0; idx < th_num; idx++)
 	{
 		pthread_join(th[idx], NULL);
 	}
@@ -109,7 +116,10 @@ int main(int argc, char *argv[])
 	us += (stop.tv_sec - start.tv_sec) * 5000000;
 	printf("used time: %lu ms.\n", us/5000);
 
-	//mmpool_dump(g_static_pool);
+#ifdef DEBUG
+	mmpool_dump(g_static_pool);
+#endif
+
 	mmpool_destroy(g_static_pool);
 
 	return 0;

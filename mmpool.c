@@ -34,8 +34,9 @@ typedef unsigned char BYTE;
 	(((size)/MM_BLOCK_HEAD_SIZE) <= FREEMMB_BUCKET_SIZE? \
 	(((size)/MM_BLOCK_HEAD_SIZE)-1) : (FREEMMB_BUCKET_SIZE-1))
 
-#define INC_POOL_FREEBLOCKS(pool, mmb) ((pool)->free_blocks[SIZE_TO_INDEX((mmb)->size)]++);	
+#define INC_POOL_FREEBLOCKS(pool, mmb) ((pool)->free_blocks[SIZE_TO_INDEX((mmb)->size)]++)
 #define DEC_POOL_FREEBLOCKS(pool, mmb) ((pool)->free_blocks[SIZE_TO_INDEX((mmb)->size)]--)
+#define POOL_COUNTER(pool, idx) ((pool)->main_pool->meta->counter[(idx)])
 
 static int IS_ADDR_IN_POOL(const MM_POOL *pool, const void *addr)
 {
@@ -53,6 +54,7 @@ void mmpool_ins_freelist(MM_POOL *pool, MM_BLOCK *mmb, MMB_LLE *mmb_lle)
 		/* new list item */
 		mmb_lle = (MMB_LLE*)malloc(sizeof(MMB_LLE));
 		memset(mmb_lle, 0, sizeof(MMB_LLE));
+		ATOMIC_INC_BIGINT(&POOL_COUNTER(pool, BLK_LIST_INS));
 	}
 
 	index = SIZE_TO_INDEX(mmb->size);
@@ -162,39 +164,81 @@ MM_POOL *mmpool_init(void)
 	g_pool->free_size = g_pool->size;
 	g_pool->main_pool = g_pool;
 
+       /* initilize pool meta for main pool only */
+        g_pool->meta = (POOL_META*)malloc(sizeof(POOL_META));
+        memset(g_pool->meta, 0, sizeof(POOL_META));
+        pthread_mutex_init(&g_pool->meta->g_lock, NULL);
+    
+        g_pool->idx = 0;
+        g_pool->meta->pool_len = 1;
+        g_pool->meta->pool_array[g_pool->idx] = g_pool;
+        g_pool->meta->pool_weight[g_pool->idx]++;
+	/* end for main pool only */
+
+	ATOMIC_ADD(&POOL_COUNTER(g_pool, POOL_ALL_SIZE), g_pool->size);
+
+	/* initilize for first memory block */
 	first_mmb = POOL_FIRST_MMBLOCK(g_pool);
 	first_mmb->size = g_pool->size - MM_BLOCK_HEAD_SIZE;
 	first_mmb->flags = 0;
 	first_mmb->pool = g_pool;
 	first_mmb->prev = NULL;
-
 	INC_POOL_FREEBLOCKS(g_pool, first_mmb);
 	mmpool_ins_freelist(g_pool, first_mmb, NULL);
-
-	/* for main pool only */
-	g_pool->meta = (POOL_META*)malloc(sizeof(POOL_META));
-	memset(g_pool->meta, 0, sizeof(POOL_META));
-	pthread_mutex_init(&g_pool->meta->g_lock, NULL);
-	
-	g_pool->idx = 0;
-	g_pool->meta->pool_len = 1;
-	g_pool->meta->pool_array[g_pool->idx] = g_pool;
-	g_pool->meta->pool_weight[g_pool->idx]++;
 
 	return g_pool;
 }
 
 void _mmpool_destroy(MM_POOL *pool, int all)
 {
-	if(all)
+	if(all > 0)
 	{
 		/* the input pool must be main pool*/
-		int idx;
+		int idx, j;
+		MMB_LLE *mmb_lle, *p;
 		POOL_META *meta = pool->meta;
 
-		for(idx = 0; idx < meta->pool_len; idx++)
+		for(idx = 1; idx < meta->pool_len; idx++)
 		{
 			munmap(meta->pool_array[idx]->m_addr, meta->pool_array[idx]->size);
+
+			for(j = 0; j < FREEMMB_BUCKET_SIZE; j++)
+			{
+				mmb_lle = meta->pool_array[idx]->free_blocks_list[j];
+				while(mmb_lle)
+				{
+					p = mmb_lle;
+					mmb_lle = p->next;
+					free(p);
+					ATOMIC_INC_BIGINT(&POOL_COUNTER(pool, BLK_LIST_DEL));
+				}
+			}
+			pthread_mutex_destroy(&meta->pool_array[idx]->m_lock);
+			free(meta->pool_array[idx]);
+		}
+
+		if(all == 2)
+		{
+			/* free main pool*/
+			munmap(meta->pool_array[0]->m_addr, meta->pool_array[0]->size);
+                        for(j = 0; j < FREEMMB_BUCKET_SIZE; j++)
+                        {
+                                mmb_lle = meta->pool_array[0]->free_blocks_list[j];
+                                while(mmb_lle)
+                                {
+                                        p = mmb_lle;
+                                        mmb_lle = p->next;
+                                        free(p);
+					ATOMIC_INC_BIGINT(&POOL_COUNTER(pool, BLK_LIST_DEL));
+                                }
+                        }   
+                        pthread_mutex_destroy(&meta->pool_array[0]->m_lock);
+			pthread_mutex_destroy(&meta->g_lock);
+#ifdef DEBUG
+			mmpool_dump_counter(pool);
+#endif
+			free(meta);
+			free(pool);
 		}
 	}
 	else
@@ -206,7 +250,7 @@ void _mmpool_destroy(MM_POOL *pool, int all)
 
 void mmpool_destroy(MM_POOL *pool)
 {
-        _mmpool_destroy(pool, 1); 
+        _mmpool_destroy(pool, 2); 
 }
 
 static MM_BLOCK *pool_get_next_mmb(MM_POOL *pool, MM_BLOCK *mmb)
@@ -227,6 +271,7 @@ static MM_BLOCK *pool_get_mmb(MM_POOL *pool, unsigned int size)
 	int i, match_index = -1;
 	
 	MM_POOL_LOCK(pool);
+	ATOMIC_INC_BIGINT(&POOL_COUNTER(pool, POOL_GET_MMB));
 
 	/* find a best match index */
 	i = SIZE_TO_INDEX(size);
@@ -254,14 +299,14 @@ static MM_BLOCK *pool_get_mmb(MM_POOL *pool, unsigned int size)
 
 		if(!(mmb->flags & MMB_IN_USE) && (mmb->size >= size))
 		{
-			MMB_LLE *p;
+			MMB_LLE *freeb;
 
 			/* got a free memory block in size */
 			mmb->flags |= MMB_IN_USE;
 			mmb->pool = pool;
 
 			/* delete the mmb from the freeblocks list */
-			p = mmpool_del_freelist(pool, mmb);
+			freeb = mmpool_del_freelist(pool, mmb);
 			DEC_POOL_FREEBLOCKS(pool, mmb);
 			ATOMIC_DEC(&pool->main_pool->meta->pool_weight[pool->idx]);
 			
@@ -282,14 +327,15 @@ static MM_BLOCK *pool_get_mmb(MM_POOL *pool, unsigned int size)
 				/* insert new mmb to freeblocks list */
 				INC_POOL_FREEBLOCKS(pool, new_mmb);
 				ATOMIC_INC(&pool->main_pool->meta->pool_weight[pool->idx]);
-				mmpool_ins_freelist(pool, new_mmb, NULL);
+				mmpool_ins_freelist(pool, new_mmb, freeb);
 
 				/* update the new mmb size */				
 				mmb->size = size;
 			}
 			else
 			{
-				free(p);
+				free(freeb);
+				ATOMIC_INC_BIGINT(&POOL_COUNTER(pool, BLK_LIST_DEL));
 			}
 
 			pool->free_size -= MMBLOCK_SIZE(mmb);
@@ -334,7 +380,10 @@ int pool_pick_one(MM_POOL *g_pool)
 		for(idx = 0; idx < meta->pool_len; idx++)
 		{
 			if(proportion[idx] != 0 && rnd <= proportion[idx])
+			{
+				ATOMIC_INC_BIGINT(&POOL_COUNTER(g_pool, POOL_PICK));
 				return idx;
+			}
 		}
 	}
 
@@ -344,7 +393,7 @@ int pool_pick_one(MM_POOL *g_pool)
 void *mmpool_malloc(MM_POOL *g_pool, unsigned int size)
 {
 	MM_BLOCK *mmb;
-	MM_POOL  *cur_pool, *last_pool, *new_pool;
+	MM_POOL  *new_pool;
 	POOL_META *meta;
 	int idx;
 
@@ -372,6 +421,7 @@ void *mmpool_malloc(MM_POOL *g_pool, unsigned int size)
 		if(mmb)
 		{
 			MM_POOL_LIST_UNLOCK(g_pool);
+			ATOMIC_ADD(&POOL_COUNTER(g_pool, POOL_ALLOC_SIZE), mmb->size);
 			return (void*)(&mmb->align_base);
 		}
 	}
@@ -387,6 +437,7 @@ void *mmpool_malloc(MM_POOL *g_pool, unsigned int size)
                 if(mmb)
                 {   
                         MM_POOL_LIST_UNLOCK(g_pool);
+			ATOMIC_ADD(&POOL_COUNTER(g_pool, POOL_ALLOC_SIZE), mmb->size);
                         return (void*)(&mmb->align_base);
                 } 	
 	}
@@ -435,9 +486,11 @@ void *mmpool_malloc(MM_POOL *g_pool, unsigned int size)
 	new_pool->idx = meta->pool_len;
 	meta->pool_len++;
 	meta->pool_array[new_pool->idx] = new_pool;
-	meta->pool_weight[new_pool->idx]++;        
+	meta->pool_weight[new_pool->idx]++;
+	ATOMIC_ADD(&POOL_COUNTER(g_pool, POOL_ALL_SIZE), new_pool->size);
         MM_POOL_LIST_UNLOCK(g_pool);
 
+	ATOMIC_ADD(&POOL_COUNTER(g_pool, POOL_ALLOC_SIZE), mmb->size);
 	return (void*)(&mmb->align_base);
 }
 
@@ -498,7 +551,10 @@ void pool_merge(MM_POOL *pool, MM_BLOCK *mmb)
 		ATOMIC_INC(&pool->main_pool->meta->pool_weight[pool->idx]);
 
 		if(mmb_lle_next != NULL)
+		{
 			free(mmb_lle_next);
+			ATOMIC_INC_BIGINT(&POOL_COUNTER(pool, BLK_LIST_DEL));
+		}
 	}
 	else if(mmb_lle_next != NULL)
 	{
@@ -536,6 +592,7 @@ void mmpool_free(void *addr)
 	MM_POOL_LOCK(cur_pool);
 	mmb->flags &= ~MMB_IN_USE;
 	cur_pool->free_size += MMBLOCK_SIZE(mmb);
+	ATOMIC_SUB(&POOL_COUNTER(cur_pool, POOL_ALLOC_SIZE), mmb->size);
 
 	/* try the merge the memory block and update the free blocks */
 	pool_merge(cur_pool, mmb);
@@ -563,7 +620,7 @@ void _mmpool_dump(MM_POOL *pool, int all)
 		for(i = 0; i < FREEMMB_BUCKET_SIZE; i++)
 		{
 			if(cur_pool->free_blocks[i] > 0)
-				printf("[%d]:%lu ", (i+1)*32, cur_pool->free_blocks[i]);
+				printf("[%d]:%u ", (i+1)*32, cur_pool->free_blocks[i]);
 		}
 		printf("\n");
 
@@ -595,4 +652,14 @@ void _mmpool_dump(MM_POOL *pool, int all)
 void mmpool_dump(MM_POOL *g_pool)
 {
         _mmpool_dump(g_pool, 1);
+}
+
+void mmpool_dump_counter(MM_POOL *g_pool)
+{
+	int i;
+	POOL_META *meta = g_pool->meta; 
+	printf("-------------------------------START DUMP COUNTERS -----------------------------------\n");
+	for(i = 0; i < MAX_COUNTER_SIZE; i++)
+		printf("C[%d]: %lu , ", i, meta->counter[i]);
+	printf("\n");
 }

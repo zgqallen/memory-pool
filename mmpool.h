@@ -40,12 +40,20 @@ typedef struct mm_pool
 }MM_POOL;
 
 #define MAX_POOL_NUM 1024		/* assume the pool size not exceed 65G */
+#define MAX_COUNTER_SIZE 10
 typedef struct pool_meta
 {
 	MM_POOL *pool_array[MAX_POOL_NUM]; /* Pool array for all allocated pools. */
 	int pool_weight[MAX_POOL_NUM];	   /* Weight for each pool based on freeblocks */
 	int pool_len;			   /* Total number of current alloacted pools */
 	pthread_mutex_t g_lock;            /* mutex to protect pool meta. */
+	unsigned long long counter[MAX_COUNTER_SIZE];	   /* conter for internal error checking */
+#define BLK_LIST_INS	 0
+#define BLK_LIST_DEL	 1
+#define POOL_PICK	 2
+#define POOL_GET_MMB	 3
+#define POOL_ALL_SIZE	 4
+#define POOL_ALLOC_SIZE  5
 }POOL_META;
 
 #define MM_POOL_LOCK(pool) pthread_mutex_lock(&pool->m_lock)
@@ -54,11 +62,21 @@ typedef struct pool_meta
 #define MM_POOL_LIST_UNLOCK(pool) pthread_mutex_unlock(&pool->meta->g_lock)
 
 #ifndef ATOMIC_INC
-#define ATOMIC_INC(ptr) __sync_add_and_fetch(ptr, 1); 
+#define ATOMIC_INC(ptr) __sync_add_and_fetch(ptr, 1) 
 #endif
 #ifndef ATOMIC_DEC
-#define ATOMIC_DEC(ptr) __sync_sub_and_fetch(ptr, 1);
+#define ATOMIC_DEC(ptr) __sync_sub_and_fetch(ptr, 1)
 #endif
+#ifndef ATOMIC_ADD
+#define ATOMIC_ADD(ptr, incr) __sync_add_and_fetch(ptr, incr)
+#endif
+#ifndef ATOMIC_SUB
+#define ATOMIC_SUB(ptr, incr) __sync_sub_and_fetch(ptr, incr)
+#endif
+#ifndef ATOMIC_INC_BIGINT
+#define ATOMIC_INC_BIGINT(ptr) __sync_add_and_fetch(ptr, 1)
+#endif
+
 
 /*
 ** MMPOOL_INIT
@@ -133,4 +151,6 @@ void mmpool_free(void *addr);
 */
 void mmpool_dump(MM_POOL *pool);
 
-#endif// MMPOOL_H
+void mmpool_dump_counter(MM_POOL *g_pool);
+
+#endif
