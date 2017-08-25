@@ -167,11 +167,12 @@ MM_POOL *mmpool_init(void)
        /* initilize pool meta for main pool only */
         g_pool->meta = (POOL_META*)malloc(sizeof(POOL_META));
         memset(g_pool->meta, 0, sizeof(POOL_META));
-        pthread_mutex_init(&g_pool->meta->g_lock, NULL);
+        pthread_rwlock_init(&g_pool->meta->g_lock, NULL);
     
         g_pool->idx = 0;
         g_pool->meta->pool_len = 1;
         g_pool->meta->pool_array[g_pool->idx] = g_pool;
+	ATOMIC_INC_BIGINT(&POOL_COUNTER(g_pool, POOL_NUM));
         g_pool->meta->pool_weight[g_pool->idx]++;
 	/* end for main pool only */
 
@@ -233,7 +234,7 @@ void _mmpool_destroy(MM_POOL *pool, int all)
                                 }
                         }   
                         pthread_mutex_destroy(&meta->pool_array[0]->m_lock);
-			pthread_mutex_destroy(&meta->g_lock);
+			pthread_rwlock_destroy(&meta->g_lock);
 #ifdef DEBUG
 			mmpool_dump_counter(pool);
 #endif
@@ -405,7 +406,7 @@ void *mmpool_malloc(MM_POOL *g_pool, unsigned int size)
 	/* memory block will always be multiple of MM_BLOCK_HEAD_SIZE */
 	size = ((size + MM_BLOCK_HEAD_SIZE - 1) / MM_BLOCK_HEAD_SIZE) * MM_BLOCK_HEAD_SIZE;
 
-	MM_POOL_LIST_LOCK(g_pool);
+	MM_POOL_G_RDLOCK(g_pool);
 	/* find a befitting pool and allocate the memory */
 	idx = pool_pick_one(g_pool);
 	meta = g_pool->meta;
@@ -420,7 +421,7 @@ void *mmpool_malloc(MM_POOL *g_pool, unsigned int size)
 		mmb = pool_get_mmb(meta->pool_array[idx], size);
 		if(mmb)
 		{
-			MM_POOL_LIST_UNLOCK(g_pool);
+			MM_POOL_G_UNLOCK(g_pool);
 			ATOMIC_ADD(&POOL_COUNTER(g_pool, POOL_ALLOC_SIZE), mmb->size);
 			return (void*)(&mmb->align_base);
 		}
@@ -436,17 +437,17 @@ void *mmpool_malloc(MM_POOL *g_pool, unsigned int size)
                 mmb = pool_get_mmb(meta->pool_array[idx], size);
                 if(mmb)
                 {   
-                        MM_POOL_LIST_UNLOCK(g_pool);
+                        MM_POOL_G_UNLOCK(g_pool);
 			ATOMIC_ADD(&POOL_COUNTER(g_pool, POOL_ALLOC_SIZE), mmb->size);
                         return (void*)(&mmb->align_base);
                 } 	
 	}
-	MM_POOL_LIST_UNLOCK(g_pool);
+	MM_POOL_G_UNLOCK(g_pool);
 
 	/* no available pool could alloc, new a pool to serve */
 	new_pool = (MM_POOL*)malloc(sizeof(MM_POOL));
 	memset(new_pool, 0, sizeof(MM_POOL));
-	
+
 	if(size > (pgsize * DEFAULT_PAGE_COUNT - MM_BLOCK_HEAD_SIZE))
 	{
 		new_pool->size = ((size + pgsize + MM_BLOCK_HEAD_SIZE) / pgsize) * pgsize;
@@ -460,7 +461,7 @@ void *mmpool_malloc(MM_POOL *g_pool, unsigned int size)
 				MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if(new_pool->m_addr == MAP_FAILED)
 	{
-		printf("memory pool mmap failed, errno %d.\n", errno);
+		printf("memory pool mmap failed for size %u, errno %d.\n", new_pool->size, errno);
 		free(new_pool);
 		return NULL;
 	}
@@ -481,14 +482,15 @@ void *mmpool_malloc(MM_POOL *g_pool, unsigned int size)
 	/* allocate memory from new pool */
 	mmb = pool_get_mmb(new_pool, size);
 
-        MM_POOL_LIST_LOCK(g_pool);
+        MM_POOL_G_WRLOCK(g_pool);
 	/* add to main pool array */
 	new_pool->idx = meta->pool_len;
 	meta->pool_len++;
 	meta->pool_array[new_pool->idx] = new_pool;
+	ATOMIC_INC_BIGINT(&POOL_COUNTER(g_pool, POOL_NUM));
 	meta->pool_weight[new_pool->idx]++;
 	ATOMIC_ADD(&POOL_COUNTER(g_pool, POOL_ALL_SIZE), new_pool->size);
-        MM_POOL_LIST_UNLOCK(g_pool);
+        MM_POOL_G_UNLOCK(g_pool);
 
 	ATOMIC_ADD(&POOL_COUNTER(g_pool, POOL_ALLOC_SIZE), mmb->size);
 	return (void*)(&mmb->align_base);

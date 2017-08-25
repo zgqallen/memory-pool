@@ -46,20 +46,22 @@ typedef struct pool_meta
 	MM_POOL *pool_array[MAX_POOL_NUM]; /* Pool array for all allocated pools. */
 	int pool_weight[MAX_POOL_NUM];	   /* Weight for each pool based on freeblocks */
 	int pool_len;			   /* Total number of current alloacted pools */
-	pthread_mutex_t g_lock;            /* mutex to protect pool meta. */
+	pthread_rwlock_t g_lock;           /* rwlock to protect pool meta. */
 	unsigned long long counter[MAX_COUNTER_SIZE];	   /* conter for internal error checking */
 #define BLK_LIST_INS	 0
 #define BLK_LIST_DEL	 1
 #define POOL_PICK	 2
 #define POOL_GET_MMB	 3
 #define POOL_ALL_SIZE	 4
-#define POOL_ALLOC_SIZE  5
+#define POOL_NUM	 5
+#define POOL_ALLOC_SIZE  6
 }POOL_META;
 
 #define MM_POOL_LOCK(pool) pthread_mutex_lock(&pool->m_lock)
 #define MM_POOL_UNLOCK(pool) pthread_mutex_unlock(&pool->m_lock)
-#define MM_POOL_LIST_LOCK(pool) pthread_mutex_lock(&pool->meta->g_lock)
-#define MM_POOL_LIST_UNLOCK(pool) pthread_mutex_unlock(&pool->meta->g_lock)
+#define MM_POOL_G_RDLOCK(pool) pthread_rwlock_rdlock(&pool->meta->g_lock)
+#define MM_POOL_G_WRLOCK(pool) pthread_rwlock_wrlock(&pool->meta->g_lock)
+#define MM_POOL_G_UNLOCK(pool) pthread_rwlock_unlock(&pool->meta->g_lock)
 
 #ifndef ATOMIC_INC
 #define ATOMIC_INC(ptr) __sync_add_and_fetch(ptr, 1) 
